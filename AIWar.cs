@@ -7,6 +7,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using MoonSharp.Interpreter;
+using MoonSharp.Interpreter.Loaders;
 using MoonSharp.Interpreter.Serialization.Json;
 
 namespace AI_War
@@ -225,6 +226,7 @@ namespace AI_War
 		public static Script InitializeScript(Player p) {
 			p.dynamicScript = new Script();
 			var s = p.dynamicScript;
+			((ScriptLoaderBase)s.Options.ScriptLoader).ModulePaths = ScriptLoaderBase.UnpackStringPaths("C:\\Users\\Ecoste\\Desktop\\AIWar\\AIWar\\?.lua");
 			s.Globals["move"] = api.Move(p.name);
 			s.Globals["create_ship"] = api.CreateShip(p.name);
 			s.Globals["map"] = map.LuaMap(s);
@@ -299,6 +301,7 @@ namespace AI_War
 					name = "Player " + i.ToString(),
 					memory = new Memory(),
 					script= @"
+inspect = require('inspect')
 ship = my_ship()
 if ship == -2 then
 	ship = create_ship(5, 5)
@@ -310,7 +313,7 @@ if (type(ship) == 'table') then
 	_G.memory = {ship=ship.id}
 	print(ship.x)
 end
-
+print(inspect(ship))
 --print(#map[5][5])"
 				});
 			}
