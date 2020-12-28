@@ -104,15 +104,20 @@ namespace AI_War
 		}
 
 		private DynValue MyShip(Player player) {
+			Table ret = new Table(player.dynamicScript);
+			ret.Set(1, DynValue.Nil);
+			ret.Set(2, DynValue.NewNumber((int)API_RETURNS.NOT_FOUND));
 			foreach (Cell cell in map.cells.Cast<Cell>()) {
 				foreach (IGameObject go in cell) {
 					if (go is Ship && ((Ship)go).owner == player.name) {
-						return DynValue.NewTable(go.Table(player.dynamicScript));
+						ret.Set(1, DynValue.NewTable(go.Table(player.dynamicScript)));
+						ret.Set(2, DynValue.NewNumber((int)API_RETURNS.OK));
+						break;
 					}
 				}
 			}
-
-			return DynValue.NewNumber((int)API_RETURNS.NOT_FOUND);
+			
+			return DynValue.NewTable(ret);
 		}
 
 		public Func<DynValue> MyShipBind(Player player) {
@@ -163,28 +168,36 @@ namespace AI_War
 			public int x;
 			public int y;
 		}
-		private int CreateShip(string playerName, int x, int y) {
+		private DynValue CreateShip(Player player, int x, int y) {
+			Table ret = new Table(player.dynamicScript);
+			ret.Set(1, DynValue.Nil);
+			ret.Set(2, DynValue.NewNumber((int)API_RETURNS.NOT_FOUND));
 			if (x > Map.WIDTH || y > Map.HEIGHT || x <= 0 || y <= 0) {
-				return (int)API_RETURNS.INVALID_ARGUMENTS;
+				ret.Set(2, DynValue.NewNumber((int)API_RETURNS.INVALID_ARGUMENTS));
+				return DynValue.NewTable(ret);
 			}
 			foreach(Cell cell in map.cells.Cast<Cell>()) {  // Check if ship already exists on map.
 				foreach(IGameObject go in cell) {
-					if (go is Ship && ((Ship)go).owner == playerName) {
-						return (int)API_RETURNS.ERROR;
+					if (go is Ship && ((Ship)go).owner == player.name) {
+						ret.Set(2, DynValue.NewNumber((int)API_RETURNS.ERROR));
+						return DynValue.NewTable(ret);
 					}
 				}
 			}
 
-			if (addShipBag.Any(x => x.owner == playerName)) {  // Check if already tried to create ship this tick.
-				return (int)API_RETURNS.ERROR;
+			if (addShipBag.Any(x => x.owner == player.name)) {  // Check if already tried to create ship this tick.
+				ret.Set(2, DynValue.NewNumber((int)API_RETURNS.ERROR));
+				return DynValue.NewTable(ret);
 			}
 
 			int id = IDCounter.NewID();
-			addShipBag.Add(new AddShipEvent { id = id, owner = playerName, x = x, y = y });
-			return id;
+			addShipBag.Add(new AddShipEvent { id = id, owner = player.name, x = x, y = y });
+			ret.Set(1, DynValue.NewNumber(id));
+			ret.Set(2, DynValue.NewNumber((int)API_RETURNS.OK));
+			return DynValue.NewTable(ret);
 		}
-		public Func<int, int, int> CreateShip(string playerName) {
-			return (t2, t3) => CreateShip(playerName, t2, t3);
+		public Func<int, int, DynValue> CreateShip(Player player) {
+			return (t2, t3) => CreateShip(player, t2, t3);
 		}
 	}
 
@@ -228,9 +241,10 @@ namespace AI_War
 			var s = p.dynamicScript;
 			((ScriptLoaderBase)s.Options.ScriptLoader).ModulePaths = ScriptLoaderBase.UnpackStringPaths("C:\\Users\\Ecoste\\Desktop\\AIWar\\AIWar\\?.lua");
 			s.Globals["move"] = api.Move(p.name);
-			s.Globals["create_ship"] = api.CreateShip(p.name);
+			s.Globals["create_ship"] = api.CreateShip(p);
 			s.Globals["map"] = map.LuaMap(s);
 			s.Globals["my_ship"] = api.MyShipBind(p);
+			s.DoFile("C:\\Users\\Ecoste\\Desktop\\AIWar\\AIWar\\player_base.lua");
 			if (!String.IsNullOrEmpty(p.memory.json)) {
 				Console.WriteLine("memory: " + p.memory.json);
 				s.Globals["memory"] = JsonTableConverter.JsonToTable(p.memory.json);
@@ -301,19 +315,16 @@ namespace AI_War
 					name = "Player " + i.ToString(),
 					memory = new Memory(),
 					script= @"
-inspect = require('inspect')
-ship = my_ship()
-if ship == -2 then
-	ship = create_ship(5, 5)
-else
-	print('move: ' .. move(ship.id, 1, 0))
-end
-
-if (type(ship) == 'table') then
-	_G.memory = {ship=ship.id}
-	print(ship.x)
-end
+ship, err = my_ship()
 print(inspect(ship))
+print(err)
+if err != 0 then
+	id, err = create_ship(5, 5)
+	print(id)
+    print(err)
+end
+print('------------')
+
 --print(#map[5][5])"
 				});
 			}
