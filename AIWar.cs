@@ -8,24 +8,39 @@ using System.Threading;
 using System.Threading.Tasks;
 using MoonSharp.Interpreter;
 using MoonSharp.Interpreter.Serialization.Json;
-using Nancy.Json;
 
 namespace AI_War
 {
 	public enum API_RETURNS
 	{
-		OK,
-		ERROR,
+		OK = 0,
+		ERROR = -1,
+		NOT_FOUND = -2,
+		NO_PERMISSION = -3,
+		INVALID_ARGUMENTS = -4,
 	}
 
 	public abstract class IGameObject {
 		public int id { get; set; }
 		public string owner { get; set; }
 		public abstract string type { get; }
+		public abstract Table Table(Script owner);
+		public int x { get; set; }
+		public int y { get; set; }
 	}
 
 	public class Ship : IGameObject {
 		public override string type => "ship";
+
+		public override Table Table(Script owner) {
+			var t = new Table(owner);
+			t.Set("id", DynValue.NewNumber(id));
+			t.Set("owner", DynValue.NewString(this.owner));
+			t.Set("type", DynValue.NewString(type));
+			t.Set("x", DynValue.NewNumber(x+1));
+			t.Set("y", DynValue.NewNumber(y+1));
+			return t;
+		}
 	}
 
 	public class Memory {
@@ -87,28 +102,57 @@ namespace AI_War
 			this.map = map;
 		}
 
-		private int MyShip(string playerName) {
+		private DynValue MyShip(Player player) {
 			foreach (Cell cell in map.cells.Cast<Cell>()) {
 				foreach (IGameObject go in cell) {
-					if (go is Ship && ((Ship)go).owner == playerName) {
-						return go.id;
+					if (go is Ship && ((Ship)go).owner == player.name) {
+						return DynValue.NewTable(go.Table(player.dynamicScript));
 					}
 				}
 			}
 
-			return 0;
+			return DynValue.NewNumber((int)API_RETURNS.NOT_FOUND);
 		}
 
-		public Func<int> MyShipBind(string playerName) {
-			return () => MyShip(playerName);
+		public Func<DynValue> MyShipBind(Player player) {
+			return () => MyShip(player);
 		}
 
-		private int Move(string player, string objID, string dir) {
+		public class MoveEvent {
+			public IGameObject go;
+			public int newX;
+			public int newY;
+		}
+		public ConcurrentBag<MoveEvent> moveBag = new ConcurrentBag<MoveEvent>();
+		private int Move(string player, int objID, int x, int y) {
+			IGameObject objToMove = null;
+			foreach (Cell cell in map.cells.Cast<Cell>()) {
+				foreach (IGameObject go in cell) {
+					if (go.id == objID) {
+						objToMove = go;
+						break;
+					}
+				}
+			}
+			if (objToMove == null) {
+				return (int)API_RETURNS.NOT_FOUND;
+			}
+			if (objToMove.owner != player) {
+				return (int)API_RETURNS.NO_PERMISSION;
+			}
+
+			int newX = objToMove.x + x;
+			int newY = objToMove.y + y;
+			if (newX >= Map.WIDTH || newY >= Map.HEIGHT || newX < 0 || newY < 0) {
+				return (int)API_RETURNS.INVALID_ARGUMENTS;
+			}
+
+			moveBag.Add(new MoveEvent { go = objToMove, newX = newX, newY = newY });
 			return (int)API_RETURNS.OK;
 		}
 
-		public Func<string, string, int> Move(string playerName) {
-			return (t2, t3) => Move(playerName, t2, t3);
+		public Func<int, int, int, int> Move(string playerName) {
+			return (t2, t3, t4) => Move(playerName, t2, t3, t4);
 		}
 
 		public ConcurrentBag<AddShipEvent> addShipBag = new ConcurrentBag<AddShipEvent>();
@@ -119,6 +163,9 @@ namespace AI_War
 			public int y;
 		}
 		private int CreateShip(string playerName, int x, int y) {
+			if (x > Map.WIDTH || y > Map.HEIGHT || x <= 0 || y <= 0) {
+				return (int)API_RETURNS.INVALID_ARGUMENTS;
+			}
 			foreach(Cell cell in map.cells.Cast<Cell>()) {  // Check if ship already exists on map.
 				foreach(IGameObject go in cell) {
 					if (go is Ship && ((Ship)go).owner == playerName) {
@@ -144,6 +191,7 @@ namespace AI_War
 		public string name;
 		public string script;
 		public Memory memory;
+		public Script dynamicScript;  // Reference to the current tick's script.
 	}
 
 	static class IDCounter
@@ -175,11 +223,12 @@ namespace AI_War
 		}
 
 		public static Script InitializeScript(Player p) {
-			var s = new Script();
+			p.dynamicScript = new Script();
+			var s = p.dynamicScript;
 			s.Globals["move"] = api.Move(p.name);
 			s.Globals["create_ship"] = api.CreateShip(p.name);
 			s.Globals["map"] = map.LuaMap(s);
-			s.Globals["my_ship"] = api.MyShipBind(p.name);
+			s.Globals["my_ship"] = api.MyShipBind(p);
 			if (!String.IsNullOrEmpty(p.memory.json)) {
 				Console.WriteLine("memory: " + p.memory.json);
 				s.Globals["memory"] = JsonTableConverter.JsonToTable(p.memory.json);
@@ -224,9 +273,19 @@ namespace AI_War
 				var ship = new Ship();
 				ship.id = se.id;
 				ship.owner = se.owner;
-				map[se.x-1, se.y-1].contents.Add(ship);
+				ship.x = se.x-1;
+				ship.y = se.y-1;
+				map[ship.x, ship.y].contents.Add(ship);
 			}
 			api.addShipBag.Clear();
+
+			foreach (var me in api.moveBag) {
+				map.cells[me.go.x, me.go.y].contents.Remove(me.go);
+				me.go.x = me.newX;
+				me.go.y = me.newY;
+				map.cells[me.go.x, me.go.y].contents.Add(me.go);
+			}
+			api.moveBag.Clear();
 		}
 
 		static void Main(string[] args)
@@ -240,20 +299,21 @@ namespace AI_War
 					name = "Player " + i.ToString(),
 					memory = new Memory(),
 					script= @"
---if _G.memory ~= nil then
-	--print(_G.memory.ship)
---end
 ship = my_ship()
-print('my_ship: ' .. ship)
-if ship == 0 then
+if ship == -2 then
 	ship = create_ship(5, 5)
+else
+	print('move: ' .. move(ship.id, 1, 0))
 end
-print('my_ship: ' .. ship)
-_G.memory = {ship=ship}
+
+if (type(ship) == 'table') then
+	_G.memory = {ship=ship.id}
+	print(ship.x)
+end
+
 --print(#map[5][5])"
 				});
 			}
-
 			RunAllScripts(players);
 			ResolveEvents();
 			RunAllScripts(players);

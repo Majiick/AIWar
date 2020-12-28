@@ -7,8 +7,12 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="MoonSharp" Version="2.0.0" />
-    <PackageReference Include="Nancy" Version="2.0.0" />
+    <Reference Include="MoonSharp">
+      <HintPath>..\..\moonsharp\src\MoonSharp\obj\Release\MoonSharp.exe</HintPath>
+    </Reference>
+    <Reference Include="MoonSharp.Interpreter">
+      <HintPath>..\..\moonsharp\src\MoonSharp.Interpreter\bin\Release\MoonSharp.Interpreter.dll</HintPath>
+    </Reference>
   </ItemGroup>
 
 </Project>
