@@ -7,6 +7,8 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using MoonSharp.Interpreter;
+using MoonSharp.Interpreter.Serialization.Json;
+using Nancy.Json;
 
 namespace AI_War
 {
@@ -24,6 +26,10 @@ namespace AI_War
 
 	public class Ship : IGameObject {
 		public override string type => "ship";
+	}
+
+	public class Memory {
+		public string json;
 	}
 
 	public class Cell : IEnumerable {
@@ -54,6 +60,7 @@ namespace AI_War
 
 
 		public DynValue LuaMap(Script s) {
+			DynValue.NewTable(s, new DynValue { });
 			var map = new Table(s);
 		    for (int x = 0; x < WIDTH; x++) {
 				var xTable = new Table(s);
@@ -105,19 +112,23 @@ namespace AI_War
 		}
 
 		public ConcurrentBag<AddShipEvent> addShipBag = new ConcurrentBag<AddShipEvent>();
-		public struct AddShipEvent {
+		public class AddShipEvent {
 			public int id;
 			public string owner;
 			public int x;
 			public int y;
 		}
 		private int CreateShip(string playerName, int x, int y) {
-			foreach(Cell cell in map.cells.Cast<Cell>()) {
+			foreach(Cell cell in map.cells.Cast<Cell>()) {  // Check if ship already exists on map.
 				foreach(IGameObject go in cell) {
 					if (go is Ship && ((Ship)go).owner == playerName) {
 						return (int)API_RETURNS.ERROR;
 					}
 				}
+			}
+
+			if (addShipBag.Any(x => x.owner == playerName)) {  // Check if already tried to create ship this tick.
+				return (int)API_RETURNS.ERROR;
 			}
 
 			int id = IDCounter.NewID();
@@ -132,6 +143,7 @@ namespace AI_War
 	public struct Player {
 		public string name;
 		public string script;
+		public Memory memory;
 	}
 
 	static class IDCounter
@@ -168,6 +180,10 @@ namespace AI_War
 			s.Globals["create_ship"] = api.CreateShip(p.name);
 			s.Globals["map"] = map.LuaMap(s);
 			s.Globals["my_ship"] = api.MyShipBind(p.name);
+			if (!String.IsNullOrEmpty(p.memory.json)) {
+				Console.WriteLine("memory: " + p.memory.json);
+				s.Globals["memory"] = JsonTableConverter.JsonToTable(p.memory.json);
+			}
 			return s;
 		}
 
@@ -178,6 +194,10 @@ namespace AI_War
 				watch.Start();
 				var s = InitializeScript(player);
 				var r = s.DoString(player.script);
+				if (s.Globals["memory"] != null) {
+					player.memory.json = JsonTableConverter.TableToJson(s.Globals["memory"] as Table);
+					Debug.WriteLine(player.memory.json);
+				}
 				return (r, watch.ElapsedMilliseconds);
 			});
 		}
@@ -215,19 +235,29 @@ namespace AI_War
 			map = new Map();
 			api = new GameApi(map);
 			List<Player> players = new List<Player>();
-			for (int i = 0; i < 10; i++) {
+			for (int i = 0; i < 1; i++) {
 				players.Add(new Player {
 					name = "Player " + i.ToString(),
+					memory = new Memory(),
 					script= @"
+--if _G.memory ~= nil then
+	--print(_G.memory.ship)
+--end
 ship = my_ship()
+print('my_ship: ' .. ship)
 if ship == 0 then
-	create_ship(5, 5)
+	ship = create_ship(5, 5)
 end
-print(create_ship(5, 5))
+print('my_ship: ' .. ship)
+_G.memory = {ship=ship}
 --print(#map[5][5])"
 				});
 			}
 
+			RunAllScripts(players);
+			ResolveEvents();
+			RunAllScripts(players);
+			ResolveEvents();
 			RunAllScripts(players);
 			ResolveEvents();
 			RunAllScripts(players);
