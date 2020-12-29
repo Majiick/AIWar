@@ -3,9 +3,11 @@ using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Grpc.Net.Client;
 using MoonSharp.Interpreter;
 using MoonSharp.Interpreter.Loaders;
 using MoonSharp.Interpreter.Serialization.Json;
@@ -74,7 +76,6 @@ namespace AI_War
 			}
 		}
 
-
 		public DynValue LuaMap(Script s) {
 			DynValue.NewTable(s, new DynValue { });
 			var map = new Table(s);
@@ -85,7 +86,7 @@ namespace AI_War
 					var contents = new Table(s);
 					int contentCount = 1;
 					foreach (IGameObject g in cells[x, y]) {
-						contents.Set(contentCount, DynValue.NewNumber(g.id));
+						contents.Set(contentCount, DynValue.NewTable(g.Table(s)));
 						contentCount++;
 					}
 					xTable.Set(y + 1, DynValue.NewTable(contents));
@@ -94,6 +95,10 @@ namespace AI_War
 
 			var m = DynValue.NewTable(map);
 			return m;
+		}
+
+		public string JsonMap() {
+			return JsonTableConverter.ObjectToJson(LuaMap(new Script()).Table);
 		}
 	}
 
@@ -201,18 +206,26 @@ namespace AI_War
 		}
 	}
 
-	public struct Player {
+	public class Player {
 		public string name;
 		public string script;
 		public Memory memory;
+
 		public Script dynamicScript;  // Reference to the current tick's script.
 	}
 
-	static class IDCounter
-	{
-		public static int idCounter = 1000;  // Set to 1000 so it doesn't clash with returning error codes.
+	static class IDCounter {
+		private static int idCounter = 1000;  // Set to 1000 so it doesn't clash with returning error codes.
 		public static int NewID() {
 			return Interlocked.Increment(ref idCounter);
+		}
+	}
+
+	static class RandomSeed
+	{
+		private static int num = 0;
+		public static int NewNumber() {
+			return Interlocked.Increment(ref num);
 		}
 	}
 
@@ -244,6 +257,7 @@ namespace AI_War
 			s.Globals["create_ship"] = api.CreateShip(p);
 			s.Globals["map"] = map.LuaMap(s);
 			s.Globals["my_ship"] = api.MyShipBind(p);
+			s.Globals["incrementing_number"] = (Func<int>)(() => { return RandomSeed.NewNumber(); });
 			s.DoFile("C:\\Users\\Ecoste\\Desktop\\AIWar\\AIWar\\player_base.lua");
 			if (!String.IsNullOrEmpty(p.memory.json)) {
 				Console.WriteLine("memory: " + p.memory.json);
@@ -252,34 +266,52 @@ namespace AI_War
 			return s;
 		}
 
+		struct ScriptRunResult {
+			public DynValue result;
+			public long executionTime;  // In milliseconds
+			public Exception error;
+		}
+
 		// Returns the DynValue return and the amount of milliseconds it took to run.
-		static Task<(DynValue, long)> RunScriptAsync(Player player) {
+		static Task<ScriptRunResult> RunScriptAsync(Player player) {
 			return Task.Run(() => {
 				var watch = new Stopwatch();
 				watch.Start();
 				var s = InitializeScript(player);
-				var r = s.DoString(player.script);
+				DynValue r = null;
+				Exception error = null;
+				try { 
+					r = s.DoString(player.script);
+				} catch (Exception e) {
+					error = e;
+				}
 				if (s.Globals["memory"] != null) {
 					player.memory.json = JsonTableConverter.TableToJson(s.Globals["memory"] as Table);
 					Debug.WriteLine(player.memory.json);
 				}
-				return (r, watch.ElapsedMilliseconds);
+				return new ScriptRunResult { result=r, executionTime=watch.ElapsedMilliseconds, error=error };
 			});
 		}
 
-		static void RunAllScripts(List<Player> players)
-		{
+		static void WritePlayerError(string playerName, string error) {
+			string path = @"E:\tmp\errors\";
+			File.WriteAllText(path + playerName + ".txt", error);
+		}
+
+		static void RunAllScripts(List<Player> players) {
 			// Each script will do a bunch of events such as move and attack.
 			// These events need to all be connected and at the end all resolved.
-			List<Task<(DynValue, long)>> tasks = new List<Task<(DynValue, long)>>();
-			players.ForEach((script) => tasks.Add(RunScriptAsync(script)));
+			List<(Player, Task<ScriptRunResult>)> tasks = new List<(Player, Task<ScriptRunResult>)>();
+			players.ForEach(p => tasks.Add((p, RunScriptAsync(p))));
 			Thread.Sleep(1000);	
 			
 			foreach (var t in tasks) {
-				if (t.IsCompleted) {
-					Console.WriteLine("Script completed, took " + t.Result.Item2 + " ms.");
+				if (t.Item2.Result.error != null) {
+					WritePlayerError(t.Item1.name, t.Item2.Result.error.Message);
+				} else if (t.Item2.IsCompleted) {
+					Console.WriteLine("Script completed, took " + t.Item2.Result.executionTime + " ms.");
 				} else {
-					Console.WriteLine("Script timed out");
+					WritePlayerError(t.Item1.name, "Exceeded 1 second limit.");
 				}
 			}
 		}
@@ -304,38 +336,35 @@ namespace AI_War
 			api.moveBag.Clear();
 		}
 
-		static void Main(string[] args)
-        {
+		static void AddPlayers(ref List<Player> players) {
+			string path = @"e:\tmp\scripts\";
+			var scripts = Directory.EnumerateFiles(path, "*.lua");
+			foreach (string currentFile in scripts) {
+				string user = currentFile.Split('\\').Last().Replace(".lua", "");
+				string script = File.ReadAllText(currentFile);
+
+				var player = players.FirstOrDefault(x => x.name == user);
+				if (player == null) {
+					players.Add(new Player {script=script, name=user, memory = new Memory()});
+				} else {
+					player.script = script;
+				}
+			}
+		}
+
+		static void Main(string[] args) {
 			PrewarmMoonsharp();
 			map = new Map();
 			api = new GameApi(map);
 			List<Player> players = new List<Player>();
-			for (int i = 0; i < 1; i++) {
-				players.Add(new Player {
-					name = "Player " + i.ToString(),
-					memory = new Memory(),
-					script= @"
-ship, err = my_ship()
-print(inspect(ship))
-print(err)
-if err != 0 then
-	id, err = create_ship(5, 5)
-	print(id)
-    print(err)
-end
-print('------------')
 
---print(#map[5][5])"
-				});
+			while (true) {
+				AddPlayers(ref players);
+				RunAllScripts(players);
+				ResolveEvents();
+				string path = @"e:\tmp\latestMap.txt";
+				File.WriteAllText(path, map.JsonMap());
 			}
-			RunAllScripts(players);
-			ResolveEvents();
-			RunAllScripts(players);
-			ResolveEvents();
-			RunAllScripts(players);
-			ResolveEvents();
-			RunAllScripts(players);
-			ResolveEvents();
 		}
     }
 }
