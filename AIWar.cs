@@ -8,6 +8,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Grpc.Net.Client;
+using Microsoft.Extensions.Logging;
 using MoonSharp.Interpreter;
 using MoonSharp.Interpreter.Loaders;
 using MoonSharp.Interpreter.Serialization.Json;
@@ -27,23 +28,39 @@ namespace AI_War
 		public int id { get; set; }
 		public string owner { get; set; }
 		public abstract string type { get; }
-		public abstract Table Table(Script owner);
 		public int x { get; set; }
 		public int y { get; set; }
-	}
 
-	public class Ship : IGameObject {
-		public override string type => "ship";
-
-		public override Table Table(Script owner) {
+		virtual public Table Table(Script owner) {
 			var t = new Table(owner);
 			t.Set("id", DynValue.NewNumber(id));
 			t.Set("owner", DynValue.NewString(this.owner));
 			t.Set("type", DynValue.NewString(type));
-			t.Set("x", DynValue.NewNumber(x+1));
-			t.Set("y", DynValue.NewNumber(y+1));
+			t.Set("x", DynValue.NewNumber(x + 1));
+			t.Set("y", DynValue.NewNumber(y + 1));
+
 			return t;
 		}
+	}
+
+	public class Ship : IGameObject {
+		public override string type => "ship";
+		public int bombsAvailable = 3;
+
+		public override Table Table(Script owner) {
+			var t = base.Table(owner);
+			t.Set("bombs_available", DynValue.NewNumber(bombsAvailable));
+			return t;
+		}
+	}
+
+	public class Bomb : IGameObject {
+		public override string type => "bomb";
+	}
+
+	public class Explosion : IGameObject {
+		public override string type => "explosion";
+		public long tickMade { get; set; }
 	}
 
 	public class Memory {
@@ -108,6 +125,91 @@ namespace AI_War
 			this.map = map;
 		}
 
+		public class Event {}
+		public ConcurrentBag<Event> moveAndPlaceBombEvents = new ConcurrentBag<Event>();
+
+		public class PlaceBombEvent : Event {
+			public Bomb bomb;
+		}
+		private DynValue PlaceBomb(Player player) {
+			Table ret = new Table(player.dynamicScript);
+			ret.Set(1, DynValue.Nil);
+			ret.Set(2, DynValue.NewNumber((int)API_RETURNS.ERROR));
+
+			Ship playerShip = null;
+			foreach (Cell cell in map.cells.Cast<Cell>()) {
+				foreach (IGameObject go in cell) {
+					if (go is Ship && ((Ship)go).owner == player.name) {
+						playerShip = go as Ship;
+						break;
+					}
+				}
+			}
+
+			if (playerShip == null) {
+				return DynValue.NewTable(ret);
+			}
+			if (playerShip.bombsAvailable <= 0) {
+				return DynValue.NewTable(ret);
+			}
+
+			playerShip.bombsAvailable--;
+			int id = IDCounter.NewID();
+			var bomb = new Bomb();
+			bomb.id = id;
+			bomb.owner = player.name;
+			bomb.x = playerShip.x;
+			bomb.y = playerShip.y;
+			moveAndPlaceBombEvents.Add(new PlaceBombEvent { bomb = bomb });
+
+			ret.Set(1, DynValue.NewTable(bomb.Table(player.dynamicScript)).CloneAsWritable());
+			ret.Set(2, DynValue.NewNumber((int)API_RETURNS.OK));
+			return DynValue.NewTable(ret);
+		}
+		public Func<DynValue> PlaceBombBind(Player p) {
+			return () => PlaceBomb(p);
+		}
+
+		public class BombExplodeEvent {
+			public Bomb bomb;
+		}
+		public ConcurrentBag<BombExplodeEvent> bombExplodeEvents = new ConcurrentBag<BombExplodeEvent>();
+		private int ExplodeBomb(Player player, int bombID) {
+			Ship playerShip = null;
+			foreach (Cell cell in map.cells.Cast<Cell>()) {
+				foreach (IGameObject go in cell) {
+					if (go is Ship && ((Ship)go).owner == player.name) {
+						playerShip = go as Ship;
+						break;
+					}
+				}
+			}
+			if (playerShip != null) {
+				playerShip.bombsAvailable++;
+			}
+			Bomb bombToExplode = null;
+			foreach (Cell cell in map.cells.Cast<Cell>()) {
+				foreach (IGameObject go in cell) {
+					if (go.id == bombID && go is Bomb) {
+						bombToExplode = go as Bomb;
+						break;
+					}
+				}
+			}
+			if (bombToExplode == null) {
+				return (int)API_RETURNS.NOT_FOUND;
+			}
+			if (bombToExplode.owner != player.name) {
+				return (int)API_RETURNS.NO_PERMISSION;
+			}
+			bombExplodeEvents.Add(new BombExplodeEvent { bomb = bombToExplode });
+			return (int)API_RETURNS.OK;
+		}
+
+		public Func<int, int> ExplodeBomb(Player player) {
+			return (t2) => ExplodeBomb(player, t2);
+		}
+
 		private DynValue MyShip(Player player) {
 			Table ret = new Table(player.dynamicScript);
 			ret.Set(1, DynValue.Nil);
@@ -129,12 +231,11 @@ namespace AI_War
 			return () => MyShip(player);
 		}
 
-		public class MoveEvent {
+		public class MoveEvent : Event {
 			public IGameObject go;
-			public int newX;
-			public int newY;
+			public int oldX;
+			public int oldY;
 		}
-		public ConcurrentBag<MoveEvent> moveBag = new ConcurrentBag<MoveEvent>();
 		private int Move(string player, int objID, int x, int y) {
 			IGameObject objToMove = null;
 			foreach (Cell cell in map.cells.Cast<Cell>()) {
@@ -151,14 +252,18 @@ namespace AI_War
 			if (objToMove.owner != player) {
 				return (int)API_RETURNS.NO_PERMISSION;
 			}
+			if (!(objToMove is Ship)) {
+				return (int)API_RETURNS.INVALID_ARGUMENTS;
+			}
 
 			int newX = objToMove.x + x;
 			int newY = objToMove.y + y;
 			if (newX >= Map.WIDTH || newY >= Map.HEIGHT || newX < 0 || newY < 0) {
 				return (int)API_RETURNS.INVALID_ARGUMENTS;
 			}
-
-			moveBag.Add(new MoveEvent { go = objToMove, newX = newX, newY = newY });
+			moveAndPlaceBombEvents.Add(new MoveEvent { go = objToMove, oldX = objToMove.x, oldY = objToMove.y });
+			objToMove.x = newX;
+			objToMove.y = newY;
 			return (int)API_RETURNS.OK;
 		}
 
@@ -232,6 +337,7 @@ namespace AI_War
     class AIWar {
 		public static Map map;
 		public static GameApi api;
+		public static long tick;
 		
 		static void PrewarmMoonsharp() {
 			string script = @"    
@@ -250,19 +356,21 @@ namespace AI_War
 		}
 
 		public static Script InitializeScript(Player p) {
-			p.dynamicScript = new Script();
+			p.dynamicScript = new Script(CoreModules.Preset_SoftSandbox);
 			var s = p.dynamicScript;
 			((ScriptLoaderBase)s.Options.ScriptLoader).ModulePaths = ScriptLoaderBase.UnpackStringPaths("C:\\Users\\Ecoste\\Desktop\\AIWar\\AIWar\\?.lua");
 			s.Globals["move"] = api.Move(p.name);
 			s.Globals["create_ship"] = api.CreateShip(p);
 			s.Globals["map"] = map.LuaMap(s);
 			s.Globals["my_ship"] = api.MyShipBind(p);
+			s.Globals["place_bomb"] = api.PlaceBombBind(p);
 			s.Globals["incrementing_number"] = (Func<int>)(() => { return RandomSeed.NewNumber(); });
-			s.DoFile("C:\\Users\\Ecoste\\Desktop\\AIWar\\AIWar\\player_base.lua");
+			s.Globals["explode"] = api.ExplodeBomb(p);
 			if (!String.IsNullOrEmpty(p.memory.json)) {
-				Console.WriteLine("memory: " + p.memory.json);
-				s.Globals["memory"] = JsonTableConverter.JsonToTable(p.memory.json);
+				var t = JsonTableConverter.JsonToTable(p.memory.json);
+				s.Globals["memory"] = JsonTableConverter.JsonToTable(p.memory.json, s);
 			}
+			s.DoFile("C:\\Users\\Ecoste\\Desktop\\AIWar\\AIWar\\player_base.lua");
 			return s;
 		}
 
@@ -283,11 +391,12 @@ namespace AI_War
 				try { 
 					r = s.DoString(player.script);
 				} catch (Exception e) {
+					Console.WriteLine("Error: " + e.Message);
 					error = e;
 				}
 				if (s.Globals["memory"] != null) {
 					player.memory.json = JsonTableConverter.TableToJson(s.Globals["memory"] as Table);
-					Debug.WriteLine(player.memory.json);
+					Console.WriteLine("memory: " + player.memory.json);
 				}
 				return new ScriptRunResult { result=r, executionTime=watch.ElapsedMilliseconds, error=error };
 			});
@@ -316,24 +425,68 @@ namespace AI_War
 			}
 		}
 
+		static void ExplodeBomb(Bomb b) {
+			map[b.x, b.y].contents.Remove(b);
+			map[b.x, b.y].contents.Add(new Explosion { tickMade = tick, x = b.x, y = b.y });
+			for (int x = -2; x < 3; x++) {
+				for (int y = -2; y < 3; y++) {
+					int targetX = b.x + x;
+					int targetY = b.y + y;
+					if (targetX >= Map.WIDTH || targetY >= Map.HEIGHT || targetX < 0 || targetY < 0) {
+						continue;
+					}
+					List<Ship> toKill = new List<Ship>();
+					foreach (IGameObject go in map[targetX, targetY].contents) {
+						if (go is Ship) {
+							toKill.Add(go as Ship);
+						}
+					}
+					foreach (Ship ship in toKill) {
+						map[ship.x, ship.y].contents.Remove(ship);
+						List<Bomb> toExplode = new List<Bomb>();
+						foreach (Cell cell in map.cells.Cast<Cell>()) {  // Explode all bombs of the killed player.
+							foreach (IGameObject go in cell) { 
+								if (go is Bomb && go.owner == ship.owner) {
+									toExplode.Add((Bomb)go);
+								}
+							}
+						}
+						foreach (Bomb bte in toExplode) {
+							ExplodeBomb(bte);
+						}
+					}
+				}
+			}
+		}
+
 		static void ResolveEvents() {
+			foreach (var e in api.moveAndPlaceBombEvents) {
+				if (e is GameApi.MoveEvent) {
+					var me = e as GameApi.MoveEvent;
+					map.cells[me.oldX, me.oldY].contents.Remove(me.go);
+					map.cells[me.go.x, me.go.y].contents.Add(me.go);
+				}
+				if (e is GameApi.PlaceBombEvent) {
+					GameApi.PlaceBombEvent pbe = e as GameApi.PlaceBombEvent;
+					map.cells[pbe.bomb.x, pbe.bomb.y].contents.Add(pbe.bomb);
+				}
+			}
+			api.moveAndPlaceBombEvents.Clear();
+
+			foreach (var e in api.bombExplodeEvents) {
+				ExplodeBomb(e.bomb);
+			}
+			api.bombExplodeEvents.Clear();
+
 			foreach (var se in api.addShipBag) {
 				var ship = new Ship();
 				ship.id = se.id;
 				ship.owner = se.owner;
-				ship.x = se.x-1;
-				ship.y = se.y-1;
+				ship.x = se.x - 1;
+				ship.y = se.y - 1;
 				map[ship.x, ship.y].contents.Add(ship);
 			}
 			api.addShipBag.Clear();
-
-			foreach (var me in api.moveBag) {
-				map.cells[me.go.x, me.go.y].contents.Remove(me.go);
-				me.go.x = me.newX;
-				me.go.y = me.newY;
-				map.cells[me.go.x, me.go.y].contents.Add(me.go);
-			}
-			api.moveBag.Clear();
 		}
 
 		static void AddPlayers(ref List<Player> players) {
@@ -352,18 +505,38 @@ namespace AI_War
 			}
 		}
 
+		static void CleanUpExplosions() {
+			// This should be in the gameObject.Update or something.
+			List<Explosion> toRemove = new List<Explosion>();
+			foreach (Cell cell in map.cells.Cast<Cell>()) {  // Check if ship already exists on map.
+				foreach (IGameObject go in cell) {
+					if (go is Explosion) {
+						Explosion e = go as Explosion;
+						if (tick > e.tickMade) {
+							toRemove.Add(e);
+						}
+					}
+				}
+			}
+
+			foreach (Explosion e in toRemove) {
+				map[e.x, e.y].contents.Remove(e);
+			}
+		}
+
 		static void Main(string[] args) {
 			PrewarmMoonsharp();
 			map = new Map();
 			api = new GameApi(map);
 			List<Player> players = new List<Player>();
-
 			while (true) {
 				AddPlayers(ref players);
 				RunAllScripts(players);
 				ResolveEvents();
+				CleanUpExplosions();
 				string path = @"e:\tmp\latestMap.txt";
 				File.WriteAllText(path, map.JsonMap());
+				tick++;
 			}
 		}
     }
