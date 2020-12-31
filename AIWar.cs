@@ -321,10 +321,16 @@ namespace AI_War
 		}
 	}
 
+	public class oneOffScript {
+		public string script;
+		public bool executed;
+	}
+
 	public class Player {
 		public string name;
 		public string script;
 		public Memory memory;
+		public oneOffScript oneOff;
 	}
 
 	static class IDCounter {
@@ -390,19 +396,19 @@ namespace AI_War
 		}
 
 		// Returns the DynValue return and the amount of milliseconds it took to run.
-		static Task<ScriptRunResult> RunScriptAsync(Player player, oneOffScript oneOffOverride = null) {
+		static Task<ScriptRunResult> RunScriptAsync(Player player) {
 			return Task.Run(() => {
 				var watch = new Stopwatch();
 				watch.Start();
 				var s = InitializeScript(player);
 				DynValue r = null;
 				Exception error = null;
+				string script = player.script;
+				if (player.oneOff != null && !player.oneOff.executed) {
+					script += "\n" + player.oneOff.script;
+				}
 				try {
-					if (oneOffOverride != null && !String.IsNullOrEmpty(oneOffOverride.script)) {
-						r = s.DoString(oneOffOverride.script);
-					} else {
-						r = s.DoString(player.script);
-					}
+					r = s.DoString(script);
 				} catch (Exception e) {
 					Console.WriteLine("Error: " + e.Message);
 					error = e;
@@ -411,8 +417,8 @@ namespace AI_War
 					player.memory.json = JsonTableConverter.TableToJson(s.Globals["memory"] as Table);
 					Console.WriteLine("memory: " + player.memory.json);
 				}
-				if (oneOffOverride != null) {
-					oneOffOverride.executed = true;
+				if (player.oneOff != null) {
+					player.oneOff.executed = true;
 				}
 				return new ScriptRunResult { result=r, executionTime=watch.ElapsedMilliseconds, error=error };
 			});
@@ -422,16 +428,11 @@ namespace AI_War
 			redis.GetDatabase().StringSet(playerName + "_error", error);
 		}
 
-		static void RunAllScripts(List<Player> players, ConcurrentDictionary<Player, oneOffScript> oneOffs) {
+		static void RunAllScripts(List<Player> players) {
 			// Each script will do a bunch of events such as move and attack.
 			// These events need to all be connected and at the end all resolved.
 			List<(Player, Task<ScriptRunResult>)> tasks = new List<(Player, Task<ScriptRunResult>)>();
 			players.ForEach(p => tasks.Add((p, RunScriptAsync(p))));
-			foreach (var kv in oneOffs) {
-				if (!kv.Value.executed) {
-					tasks.Add((kv.Key, RunScriptAsync(kv.Key, oneOffOverride: kv.Value)));
-				}
-			}
 			Thread.Sleep(1000);
 
 			foreach (var t in tasks) {
@@ -564,22 +565,13 @@ namespace AI_War
 		static void DebugAddScript(ref List<Player> players, string user, string script) {
 			players.Add(new Player { script = script, name = user, memory = new Memory() });
 		}
-		public class oneOffScript {
-			public string script;
-			public bool executed;
-		}
-		static ConcurrentDictionary<Player, oneOffScript> oneOffs = new ConcurrentDictionary<Player, oneOffScript>();
-		static void FilterExecutedOneOffs() {
+		
+		static void FilterExecutedOneOffs(ref List<Player> players) {
 			List<Player> toRemove = new List<Player>();
-			foreach(var kv in oneOffs) {
-				if (kv.Value.executed) {
-					toRemove.Add(kv.Key);
+			foreach(var p in players) {
+				if (p.oneOff != null && p.oneOff.executed) {
+					p.oneOff = null;
 				}
-			}
-
-			foreach (var k in toRemove) {
-				oneOffScript of;
-				oneOffs.TryRemove(k, out of);
 			}
 		}
 		static void Main(string[] args) {
@@ -589,7 +581,7 @@ namespace AI_War
 				dynamic obj = JsonConvert.DeserializeObject((string)message);
 				var player = players.FirstOrDefault(x => x.name == (string)obj.user);
 				if (player != null) {
-					oneOffs.TryAdd(player, new oneOffScript { script = (string)obj.code });
+					player.oneOff = new oneOffScript { script = (string)obj.code };
 				}
 			});
 
@@ -598,12 +590,12 @@ namespace AI_War
 			api = new GameApi(map);
 			while (true) {
 				AddPlayers(ref players);
-				RunAllScripts(players, oneOffs);
+				RunAllScripts(players);
 				ResolveEvents();
 				CleanUpExplosions();
 				redis.GetDatabase().StringSet("latest_map", map.JsonMap());
 				tick++;
-				FilterExecutedOneOffs();
+				FilterExecutedOneOffs(ref players);
 				GC.Collect();
 				GC.WaitForPendingFinalizers();
 			}
