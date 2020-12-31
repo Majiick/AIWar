@@ -259,12 +259,18 @@ namespace AI_War
 			if (!(objToMove is Ship)) {
 				return (int)API_RETURNS.INVALID_ARGUMENTS;
 			}
+			foreach (var me in moveAndPlaceBombEvents) {  // If object is already set to move then error out.
+				if (me is MoveEvent && ((MoveEvent)me).go.id == objID) {
+					return (int)API_RETURNS.ERROR;
+				}
+			}
 
 			int newX = objToMove.x + x;
 			int newY = objToMove.y + y;
 			if (newX >= Map.WIDTH || newY >= Map.HEIGHT || newX < 0 || newY < 0) {
 				return (int)API_RETURNS.INVALID_ARGUMENTS;
 			}
+
 			moveAndPlaceBombEvents.Add(new MoveEvent { go = objToMove, oldX = objToMove.x, oldY = objToMove.y });
 			objToMove.x = newX;
 			objToMove.y = newY;
@@ -427,7 +433,6 @@ namespace AI_War
 				}
 			}
 			Thread.Sleep(1000);
-			
 
 			foreach (var t in tasks) {
 				if (t.Item2.Result.error != null) {
