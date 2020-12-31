@@ -5,13 +5,17 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
+using Grpc.Core;
 using Grpc.Net.Client;
 using Microsoft.Extensions.Logging;
 using MoonSharp.Interpreter;
 using MoonSharp.Interpreter.Loaders;
 using MoonSharp.Interpreter.Serialization.Json;
+using Newtonsoft.Json;
+using StackExchange.Redis;
 
 namespace AI_War
 {
@@ -338,6 +342,7 @@ namespace AI_War
 		public static Map map;
 		public static GameApi api;
 		public static long tick;
+		public static ConnectionMultiplexer redis;
 		
 		static void PrewarmMoonsharp() {
 			string script = @"    
@@ -381,15 +386,19 @@ namespace AI_War
 		}
 
 		// Returns the DynValue return and the amount of milliseconds it took to run.
-		static Task<ScriptRunResult> RunScriptAsync(Player player) {
+		static Task<ScriptRunResult> RunScriptAsync(Player player, oneOffScript oneOffOverride = null) {
 			return Task.Run(() => {
 				var watch = new Stopwatch();
 				watch.Start();
 				var s = InitializeScript(player);
 				DynValue r = null;
 				Exception error = null;
-				try { 
-					r = s.DoString(player.script);
+				try {
+					if (oneOffOverride != null && !String.IsNullOrEmpty(oneOffOverride.script)) {
+						r = s.DoString(oneOffOverride.script);
+					} else {
+						r = s.DoString(player.script);
+					}
 				} catch (Exception e) {
 					Console.WriteLine("Error: " + e.Message);
 					error = e;
@@ -398,22 +407,30 @@ namespace AI_War
 					player.memory.json = JsonTableConverter.TableToJson(s.Globals["memory"] as Table);
 					Console.WriteLine("memory: " + player.memory.json);
 				}
+				if (oneOffOverride != null) {
+					oneOffOverride.executed = true;
+				}
 				return new ScriptRunResult { result=r, executionTime=watch.ElapsedMilliseconds, error=error };
 			});
 		}
 
 		static void WritePlayerError(string playerName, string error) {
-			string path = @"E:\tmp\errors\";
-			File.WriteAllText(path + playerName + ".txt", error);
+			redis.GetDatabase().StringSet(playerName + "_error", error);
 		}
 
-		static void RunAllScripts(List<Player> players) {
+		static void RunAllScripts(List<Player> players, ConcurrentDictionary<Player, oneOffScript> oneOffs) {
 			// Each script will do a bunch of events such as move and attack.
 			// These events need to all be connected and at the end all resolved.
 			List<(Player, Task<ScriptRunResult>)> tasks = new List<(Player, Task<ScriptRunResult>)>();
 			players.ForEach(p => tasks.Add((p, RunScriptAsync(p))));
-			Thread.Sleep(1000);	
+			foreach (var kv in oneOffs) {
+				if (!kv.Value.executed) {
+					tasks.Add((kv.Key, RunScriptAsync(kv.Key, oneOffOverride: kv.Value)));
+				}
+			}
+			Thread.Sleep(1000);
 			
+
 			foreach (var t in tasks) {
 				if (t.Item2.Result.error != null) {
 					WritePlayerError(t.Item1.name, t.Item2.Result.error.Message);
@@ -436,22 +453,29 @@ namespace AI_War
 						continue;
 					}
 					List<Ship> toKill = new List<Ship>();
+					List<Bomb> toExplodeOtherBombs = new List<Bomb>();
 					foreach (IGameObject go in map[targetX, targetY].contents) {
 						if (go is Ship) {
 							toKill.Add(go as Ship);
 						}
+						if (go is Bomb) {
+							toExplodeOtherBombs.Add(go as Bomb);
+						}
+					}
+					foreach (Bomb bte in toExplodeOtherBombs) {
+						ExplodeBomb(bte);
 					}
 					foreach (Ship ship in toKill) {
 						map[ship.x, ship.y].contents.Remove(ship);
-						List<Bomb> toExplode = new List<Bomb>();
+						List<Bomb> toExplodeKilledPlayer = new List<Bomb>();
 						foreach (Cell cell in map.cells.Cast<Cell>()) {  // Explode all bombs of the killed player.
 							foreach (IGameObject go in cell) { 
 								if (go is Bomb && go.owner == ship.owner) {
-									toExplode.Add((Bomb)go);
+									toExplodeKilledPlayer.Add((Bomb)go);
 								}
 							}
 						}
-						foreach (Bomb bte in toExplode) {
+						foreach (Bomb bte in toExplodeKilledPlayer) {
 							ExplodeBomb(bte);
 						}
 					}
@@ -490,17 +514,14 @@ namespace AI_War
 		}
 
 		static void AddPlayers(ref List<Player> players) {
-			string path = @"e:\tmp\scripts\";
-			var scripts = Directory.EnumerateFiles(path, "*.lua");
-			foreach (string currentFile in scripts) {
-				string user = currentFile.Split('\\').Last().Replace(".lua", "");
-				string script = File.ReadAllText(currentFile);
-
+			foreach (string key in redis.GetServer(redis.GetEndPoints()[0]).Keys(pattern: "*_script")) {
+				string user = key.Replace("_script", "");
+				string script = redis.GetDatabase().StringGet(key);
 				var player = players.FirstOrDefault(x => x.name == user);
 				if (player == null) {
-					players.Add(new Player {script=script, name=user, memory = new Memory()});
+					players.Add(new Player { script = script, name = user, memory = new Memory() });
 				} else {
-					player.script = script;
+					player.script = script;  // Update script
 				}
 			}
 		}
@@ -524,19 +545,64 @@ namespace AI_War
 			}
 		}
 
+		static void StartRedis() {
+			// Data:
+			// Keys 
+			//   latest_map = latest_map_json_string
+			//   <player_name>_script = player_lua_script_string
+			//   <player_name>_error = latest_player_error_string
+
+			Process.Start(@"C:\Users\Ecoste\Desktop\AIWar\AIWar\redis\redis-server.exe");
+			redis = ConnectionMultiplexer.Connect("localhost:6379");
+			Debug.Assert(redis.IsConnected);
+			Console.WriteLine("Redis started and connected.\n\n");
+		}
+
+		static void DebugAddScript(ref List<Player> players, string user, string script) {
+			players.Add(new Player { script = script, name = user, memory = new Memory() });
+		}
+		class oneOffScript {
+			public string script;
+			public bool executed;
+		}
+		static ConcurrentDictionary<Player, oneOffScript> oneOffs = new ConcurrentDictionary<Player, oneOffScript>();
+		static void FilterExecutedOneOffs() {
+			List<Player> toRemove = new List<Player>();
+			foreach(var kv in oneOffs) {
+				if (kv.Value.executed) {
+					toRemove.Add(kv.Key);
+				}
+			}
+
+			foreach (var k in toRemove) {
+				oneOffScript of;
+				oneOffs.TryRemove(k, out of);
+			}
+		}
 		static void Main(string[] args) {
+			StartRedis();
+			List<Player> players = new List<Player>();
+			redis.GetSubscriber().Subscribe("oneoff", (channel, message) => {
+				dynamic obj = JsonConvert.DeserializeObject((string)message);
+				var player = players.FirstOrDefault(x => x.name == (string)obj.user);
+				if (player != null) {
+					oneOffs.TryAdd(player, new oneOffScript { script = (string)obj.code });
+				}
+			});
+
 			PrewarmMoonsharp();
 			map = new Map();
 			api = new GameApi(map);
-			List<Player> players = new List<Player>();
 			while (true) {
 				AddPlayers(ref players);
-				RunAllScripts(players);
+				RunAllScripts(players, oneOffs);
 				ResolveEvents();
 				CleanUpExplosions();
-				string path = @"e:\tmp\latestMap.txt";
-				File.WriteAllText(path, map.JsonMap());
+				redis.GetDatabase().StringSet("latest_map", map.JsonMap());
 				tick++;
+				FilterExecutedOneOffs();
+				GC.Collect();
+				GC.WaitForPendingFinalizers();
 			}
 		}
     }
