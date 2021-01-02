@@ -35,15 +35,16 @@ namespace AI_War
 		public int x { get; set; }
 		public int y { get; set; }
 
-		virtual public Table Table(Script owner) {
-			var t = new Table(owner);
+		virtual public DynValue Table() {
+			var dynV = DynValue.NewPrimeTable();
+			var t = dynV.Table;
 			t.Set("id", DynValue.NewNumber(id));
 			t.Set("owner", DynValue.NewString(this.owner));
 			t.Set("type", DynValue.NewString(type));
 			t.Set("x", DynValue.NewNumber(x + 1));
 			t.Set("y", DynValue.NewNumber(y + 1));
 
-			return t;
+			return dynV;
 		}
 	}
 
@@ -51,10 +52,10 @@ namespace AI_War
 		public override string type => "ship";
 		public int bombsAvailable = 3;
 
-		public override Table Table(Script owner) {
-			var t = base.Table(owner);
-			t.Set("bombs_available", DynValue.NewNumber(bombsAvailable));
-			return t;
+		public override DynValue Table() {
+			var dyn = base.Table();
+			dyn.Table.Set("bombs_available", DynValue.NewNumber(bombsAvailable));
+			return dyn;
 		}
 	}
 
@@ -85,8 +86,8 @@ namespace AI_War
 			set => cells[x, y] = value;
 		}
 
-		public const int WIDTH = 20;
-		public const int HEIGHT = 20;
+		public const int WIDTH = 50;
+		public const int HEIGHT = 50;
 		public Cell[,] cells = new Cell[WIDTH, HEIGHT];
 		
 		public Map() {
@@ -97,29 +98,40 @@ namespace AI_War
 			}
 		}
 
-		public DynValue LuaMap(Script s) {
-			DynValue.NewTable(s, new DynValue { });
-			var map = new Table(s);
-		    for (int x = 0; x < WIDTH; x++) {
-				var xTable = new Table(s);
-				map.Set(x + 1, DynValue.NewTable(xTable));
+
+		public DynValue map = null;
+		public string JSONMap = "";
+		public void SetLuaAndJsonMap() {
+			var w = new Stopwatch();
+			w.Start();
+			
+			var dynValue = DynValue.NewPrimeTable();
+			var table = dynValue.Table;
+			for (int x = 0; x < WIDTH; x++) {
+				var xTable = DynValue.NewPrimeTable().Table;
+				table.Set(x + 1, DynValue.NewTable(xTable));
 				for (int y = 0; y < HEIGHT; y++) {
-					var contents = new Table(s);
+					// This inner loop, creating the new table and doing xTable.Set is what takes the most time.
+					// Ideally we could have a "dirty" flag for tiles, where only tiles that are dirty
+					// are updated. I.e. copy the last map and only update tiles that changed.
+					var contents = DynValue.NewPrimeTable();
 					int contentCount = 1;
 					foreach (IGameObject g in cells[x, y]) {
-						contents.Set(contentCount, DynValue.NewTable(g.Table(s)));
+						contents.Table.Set(contentCount, g.Table());
 						contentCount++;
 					}
-					xTable.Set(y + 1, DynValue.NewTable(contents));
+					xTable.Set(y + 1, contents);
 				}
 			}
 
-			var m = DynValue.NewTable(map);
-			return m;
+			map = dynValue;
+			JSONMap = JsonMap(dynValue);
+			Console.WriteLine("SetLuaAndJsonMap() took " + w.ElapsedMilliseconds + "ms.");
 		}
 
-		public string JsonMap() {
-			return JsonTableConverter.ObjectToJson(LuaMap(new Script()).Table);
+		private string JsonMap(DynValue map) {
+			var ret = JsonTableConverter.ObjectToJson(map);
+			return ret;
 		}
 	}
 
@@ -166,7 +178,7 @@ namespace AI_War
 			bomb.y = playerShip.y;
 			moveAndPlaceBombEvents.Add(new PlaceBombEvent { bomb = bomb });
 
-			ret.Set(1, DynValue.NewTable(bomb.Table(ownerScript)).CloneAsWritable());
+			ret.Set(1, bomb.Table());
 			ret.Set(2, DynValue.NewNumber((int)API_RETURNS.OK));
 			return DynValue.NewTable(ret);
 		}
@@ -221,7 +233,7 @@ namespace AI_War
 			foreach (Cell cell in map.cells.Cast<Cell>()) {
 				foreach (IGameObject go in cell) {
 					if (go is Ship && ((Ship)go).owner == playerName) {
-						ret.Set(1, DynValue.NewTable(go.Table(ownerScript)));
+						ret.Set(1, go.Table());
 						ret.Set(2, DynValue.NewNumber((int)API_RETURNS.OK));
 						break;
 					}
@@ -377,7 +389,7 @@ namespace AI_War
 			((ScriptLoaderBase)script.Options.ScriptLoader).ModulePaths = ScriptLoaderBase.UnpackStringPaths("C:\\Users\\Ecoste\\Desktop\\AIWar\\AIWar\\?.lua");
 			script.Globals["move"] = api.Move(p.name);
 			script.Globals["create_ship"] = api.CreateShip(p.name, script);
-			script.Globals["map"] = map.LuaMap(script);
+			script.Globals["map"] = map.JSONMap;
 			script.Globals["my_ship"] = api.MyShipBind(p.name, script);
 			script.Globals["place_bomb"] = api.PlaceBombBind(p.name, script);
 			script.Globals["incrementing_number"] = (Func<int>)(() => { return RandomSeed.NewNumber(); });
@@ -587,6 +599,13 @@ namespace AI_War
 		static void DebugAddScript(ref List<Player> players, string user, string script) {
 			players.Add(new Player { script = script, name = user, memory = new Memory() });
 		}
+
+		static void SetRedisLatestMap(Map map) {
+			var w = new Stopwatch();
+			w.Start();
+			redis.GetDatabase().StringSet("latest_map", map.JSONMap);
+			Console.WriteLine("Uploading map to Redis took " + w.ElapsedMilliseconds.ToString() + "ms.");
+		}
 		
 		static void FilterExecutedOneOffs(ref List<Player> players) {
 			List<Player> toRemove = new List<Player>();
@@ -612,10 +631,11 @@ namespace AI_War
 			api = new GameApi(map);
 			while (true) {
 				AddPlayers(ref players);
+				map.SetLuaAndJsonMap();
 				RunAllScripts(players);
 				ResolveEvents();
 				CleanUpExplosions();
-				redis.GetDatabase().StringSet("latest_map", map.JsonMap());
+				SetRedisLatestMap(map);
 				tick++;
 				FilterExecutedOneOffs(ref players);
 				GC.Collect();
