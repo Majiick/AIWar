@@ -329,6 +329,7 @@ namespace AI_War
 	public class Player {
 		public string name;
 		public string script;
+		public string stdout;
 		public Memory memory;
 		public oneOffScript oneOff;
 	}
@@ -389,26 +390,35 @@ namespace AI_War
 			return script;
 		}
 
-		struct ScriptRunResult {
-			public DynValue result;
+		struct ScriptRun {
 			public long executionTime;  // In milliseconds
 			public Exception error;
 		}
 
 		// Returns the DynValue return and the amount of milliseconds it took to run.
-		static Task<ScriptRunResult> RunScriptAsync(Player player) {
+		static Task<ScriptRun> RunScriptAsync(Player player, CancellationToken token) {
 			return Task.Run(() => {
 				var watch = new Stopwatch();
 				watch.Start();
 				var s = InitializeScript(player);
-				DynValue r = null;
+				s.Options.DebugPrint = msg => { Console.WriteLine(msg); player.stdout += msg + "\n"; };
 				Exception error = null;
 				string script = player.script;
 				if (player.oneOff != null && !player.oneOff.executed) {
 					script += "\n" + player.oneOff.script;
 				}
 				try {
-					r = s.DoString(script);
+					var chunk = s.LoadString(script);
+					DynValue coroutine = s.CreateCoroutine(chunk);
+					coroutine.Coroutine.AutoYieldCounter = 10000;
+					DynValue result = null;
+					for (result = coroutine.Coroutine.Resume();
+						result.Type == DataType.YieldRequest;
+						result = coroutine.Coroutine.Resume()) {
+						if (token.IsCancellationRequested) {
+							break;
+						}
+					}
 				} catch (Exception e) {
 					Console.WriteLine("Error: " + e.Message);
 					error = e;
@@ -420,29 +430,41 @@ namespace AI_War
 				if (player.oneOff != null) {
 					player.oneOff.executed = true;
 				}
-				return new ScriptRunResult { result=r, executionTime=watch.ElapsedMilliseconds, error=error };
+				return new ScriptRun { executionTime=watch.ElapsedMilliseconds, error=error };
 			});
-		}
-
-		static void WritePlayerError(string playerName, string error) {
-			redis.GetDatabase().StringSet(playerName + "_error", error);
 		}
 
 		static void RunAllScripts(List<Player> players) {
 			// Each script will do a bunch of events such as move and attack.
 			// These events need to all be connected and at the end all resolved.
-			List<(Player, Task<ScriptRunResult>)> tasks = new List<(Player, Task<ScriptRunResult>)>();
-			players.ForEach(p => tasks.Add((p, RunScriptAsync(p))));
-			Thread.Sleep(1000);
+			Stopwatch watch = new Stopwatch();
+			watch.Start();
+			List<(Player, Task<ScriptRun>, CancellationTokenSource)> tasks = new List<(Player, Task<ScriptRun>, CancellationTokenSource)>();
+			foreach (var p in players) {
+				CancellationTokenSource source = new CancellationTokenSource();
+				source.CancelAfter(1000);
+				tasks.Add((p, RunScriptAsync(p, source.Token), source));
+			}
 
 			foreach (var t in tasks) {
-				if (t.Item2.Result.error != null) {
-					WritePlayerError(t.Item1.name, t.Item2.Result.error.Message);
-				} else if (t.Item2.IsCompleted) {
-					Console.WriteLine("Script completed, took " + t.Item2.Result.executionTime + " ms.");
-				} else {
-					WritePlayerError(t.Item1.name, "Exceeded 1 second limit.");
+				var player = t.Item1;
+				ScriptRun result = t.Item2.Result;  // Block on result.
+				if (t.Item3.IsCancellationRequested) {
+					player.stdout += "error: Exceeded 1 second limit.\n";
+					continue;
 				}
+
+				Console.WriteLine("Script completed, took " + result.executionTime + " ms.");
+				if (t.Item2.Result.error != null) {
+					player.stdout += "error: " + t.Item2.Result.error.Message + "\n";
+				}
+
+				redis.GetDatabase().StringSet(player.name + "_stdout", player.stdout); // Set player stdout.
+			}
+
+			Console.WriteLine("All scripts took " + watch.ElapsedMilliseconds + "ms to run");
+			while (watch.ElapsedMilliseconds < 1000) {
+				Thread.Sleep(1);
 			}
 		}
 
@@ -554,7 +576,7 @@ namespace AI_War
 			// Keys 
 			//   latest_map = latest_map_json_string
 			//   <player_name>_script = player_lua_script_string
-			//   <player_name>_error = latest_player_error_string
+			//   <player_name>_stdout = latest_player_stdout_string
 
 			Process.Start(@"C:\Users\Ecoste\Desktop\AIWar\AIWar\redis\redis-server.exe");
 			redis = ConnectionMultiplexer.Connect("localhost:6379");
